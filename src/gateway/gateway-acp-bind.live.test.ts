@@ -202,6 +202,22 @@ function formatAssistantTextPreview(texts: string[], maxChars = 600): string {
   return combined.slice(-maxChars);
 }
 
+async function withTimeoutOrNull<T>(promiseFactory: () => Promise<T>, timeoutMs: number): Promise<T | null> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promiseFactory().catch(() => null),
+      new Promise<null>((resolve) => {
+        timeoutId = setTimeout(() => resolve(null), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
 async function waitForAcpBackendHealthy(timeoutMs = 60_000): Promise<void> {
   const startedAt = Date.now();
   let lastDetail: string | null = null;
@@ -210,18 +226,31 @@ async function waitForAcpBackendHealthy(timeoutMs = 60_000): Promise<void> {
     if (backend && (!backend.healthy || backend.healthy())) {
       return;
     }
-    const doctor =
+    const remainingMs = Math.max(timeoutMs - (Date.now() - startedAt), 1);
+    const getDoctor =
       typeof backend?.runtime === "object" &&
       backend.runtime &&
       "doctor" in backend.runtime &&
       typeof backend.runtime.doctor === "function"
-        ? await backend.runtime.doctor().catch(() => null)
+        ? () =>
+            (backend.runtime.doctor as () => Promise<{
+            ok?: boolean;
+            message?: string;
+            details?: string[];
+            } | null>)()
         : null;
-    const detail = !backend
+    const doctor =
+      getDoctor
+        ? await withTimeoutOrNull(
+            () => getDoctor(),
+            Math.min(1_000, remainingMs),
+          )
+        : null;
+    const detail: string = !backend
       ? "backend not registered"
       : doctor
         ? doctor.ok
-          ? doctor.message
+          ? doctor.message ?? "backend reported healthy"
           : [doctor.message, ...(doctor.details ?? [])].filter(Boolean).join(" | ")
         : "backend registered but unhealthy";
     if (detail !== lastDetail) {
