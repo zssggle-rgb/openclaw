@@ -202,10 +202,43 @@ function formatAssistantTextPreview(texts: string[], maxChars = 600): string {
   return combined.slice(-maxChars);
 }
 
+async function waitForAcpBackendHealthy(timeoutMs = 60_000): Promise<void> {
+  const startedAt = Date.now();
+  let lastDetail: string | null = null;
+  while (Date.now() - startedAt < timeoutMs) {
+    const backend = getAcpRuntimeBackend("acpx");
+    if (backend && (!backend.healthy || backend.healthy())) {
+      return;
+    }
+    const doctor =
+      typeof backend?.runtime === "object" &&
+      backend.runtime &&
+      "doctor" in backend.runtime &&
+      typeof backend.runtime.doctor === "function"
+        ? await backend.runtime.doctor().catch(() => null)
+        : null;
+    const detail = !backend
+      ? "backend not registered"
+      : doctor
+        ? doctor.ok
+          ? doctor.message
+          : [doctor.message, ...(doctor.details ?? [])].filter(Boolean).join(" | ")
+        : "backend registered but unhealthy";
+    if (detail !== lastDetail) {
+      logLiveStep(`acpx backend pending: ${detail}`);
+      lastDetail = detail;
+    }
+    await sleep(250);
+  }
+  throw new Error(
+    `timed out waiting for the acpx runtime backend to become healthy${lastDetail ? `: ${lastDetail}` : ""}`,
+  );
+}
+
 async function bindConversationAndWait(params: {
   client: GatewayClient;
   sessionKey: string;
-  liveAgent: "claude" | "codex";
+  liveAgent: "claude" | "codex" | "claude-code";
   originatingChannel: string;
   originatingTo: string;
   originatingAccountId: string;
@@ -217,16 +250,8 @@ async function bindConversationAndWait(params: {
 
   while (Date.now() - startedAt < timeoutMs) {
     attempt += 1;
-    const backend = getAcpRuntimeBackend("acpx");
-    const runtime = backend?.runtime as { probeAvailability?: () => Promise<void> } | undefined;
-    if (runtime?.probeAvailability) {
-      await runtime.probeAvailability().catch(() => {});
-    }
-    if (!(backend?.healthy?.() ?? false)) {
-      logLiveStep(`acpx backend still unhealthy before bind attempt ${attempt}`);
-      await sleep(5_000);
-      continue;
-    }
+    const remainingMs = Math.max(timeoutMs - (Date.now() - startedAt), 1_000);
+    await waitForAcpBackendHealthy(Math.min(60_000, remainingMs));
 
     await sendChatAndWait({
       client: params.client,
